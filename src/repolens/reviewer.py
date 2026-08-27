@@ -6,6 +6,7 @@ import os
 import sys
 from dataclasses import dataclass, field
 
+from .config import apply_config, filter_paths, load_repo_config
 from .diff_parser import parse_diff, validate_comment_line
 from .github_client import GitHubClient
 from .heuristics import run_heuristics
@@ -31,6 +32,9 @@ def _log(msg: str) -> None:
     print(f"[repolens] {msg}", file=sys.stderr, flush=True)
 
 
+CONFIG_NOTE = ".repolens.toml"
+
+
 @dataclass
 class ReviewConfig:
     context_budget: int = int(os.getenv("REPOLENS_CONTEXT_BUDGET", "60000"))
@@ -38,7 +42,10 @@ class ReviewConfig:
     top_k_chunks: int = 24
     min_confidence: float = 0.4
     include_heuristics: bool = True
+    batch_size: int = int(os.getenv("REPOLENS_BATCH_SIZE", "6"))
     model: str | None = None  # pin a model; None = fallback chain
+    focus_paths: list[str] = field(default_factory=list)
+    ignore_paths: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -97,6 +104,16 @@ class Reviewer:
         repo_files = iter_repo_files(repo_path)
         _log(f"indexed repo: {len(repo_files)} files")
 
+        # per-repo config (.repolens.toml) — CLI flags already set win only if
+        # explicitly provided; repo config fills the rest
+        repo_cfg = load_repo_config(repo_path)
+        if repo_cfg:
+            apply_config(self.config, repo_cfg)
+            focus = repo_cfg.get("focus") or {}
+            self.config.focus_paths = focus.get("paths") or self.config.focus_paths
+            self.config.ignore_paths = focus.get("ignore") or self.config.ignore_paths
+            _log(f"loaded {CONFIG_NOTE} from repo")
+
         return self._review(
             changes=changes,
             repo_files=repo_files,
@@ -143,13 +160,18 @@ class Reviewer:
                         pass
             _log(f"indexed local checkout: {len(repo_files)} files")
         else:
-            paths = gh.list_tree(repo, head_sha)
+            entries = gh.list_tree(repo, head_sha)
             # fetch only code-ish files, capped
-
-            code_paths = [
-                p for p in paths if detect_language(p) in CODE_LANGS or detect_language(p) in ("yaml", "toml", "json", "docker", "sql")
+            code_entries = [
+                e
+                for e in entries
+                if detect_language(e["path"]) in CODE_LANGS
+                or detect_language(e["path"]) in ("yaml", "toml", "json", "docker", "sql")
             ][:400]
-            repo_files = gh.fetch_repo_files(repo, head_sha, code_paths)
+            blob_shas = {e["path"]: e["sha"] for e in code_entries}
+            repo_files = gh.fetch_repo_files(
+                repo, head_sha, [e["path"] for e in code_entries], blob_shas=blob_shas
+            )
             file_map = {f.path: f for f in repo_files}
             for ch in changes:
                 f = file_map.get(ch.path)
@@ -186,6 +208,8 @@ class Reviewer:
         pr_title: str = "",
         pr_body: str = "",
     ) -> ReviewResult:
+        self._llm_summary = {}
+
         # 1) filter to reviewable files
         reviewable: list[FileChange] = []
         skipped: list[str] = []
@@ -199,6 +223,18 @@ class Reviewer:
                 skipped.append(ch.path)  # nothing to annotate on a deleted file
                 continue
             reviewable.append(ch)
+
+        # focus/ignore globs from repo config
+        if self.config.focus_paths or self.config.ignore_paths:
+            kept = set(
+                filter_paths(
+                    [c.path for c in reviewable],
+                    {"paths": self.config.focus_paths, "ignore": self.config.ignore_paths},
+                )
+            )
+            dropped = [c for c in reviewable if c.path not in kept]
+            reviewable = [c for c in reviewable if c.path in kept]
+            skipped.extend(c.path for c in dropped)
 
         # cap LLM workload: biggest diffs first
         reviewable.sort(key=lambda c: c.additions + c.deletions, reverse=True)
@@ -222,45 +258,65 @@ class Reviewer:
         # 2) heuristics pass (deterministic)
         heuristic_comments = run_heuristics(reviewable) if self.config.include_heuristics else []
 
-        # 3) repo-level context retrieval
+        # 3) repo-level context retrieval (BM25 + reference graph)
         retriever = RepoContextRetriever(repo_files, context_budget=self.config.context_budget)
-        context_pack, context_files = retriever.assemble_context(
-            reviewable, top_k=self.config.top_k_chunks
-        )
-        result.context_files_used = context_files
-        _log(f"context pack: {len(context_pack)} chars from {len(context_files)} repo files")
+        result.context_files_used = []
 
-        # 4) LLM review
-        messages = build_review_prompt(
-            reviewable,
-            context_pack,
-            pr_title=pr_title,
-            pr_body=pr_body,
-            base_ref=base_ref,
-            head_ref=head_ref,
-        )
+        # 4) LLM review — batched for large PRs
         llm_comments: list[ReviewComment] = []
-        try:
-            data, model_used, tokens = self.llm.chat_json(
-                messages, max_tokens=4096, model=self.config.model
+        models_used: list[str] = []
+        total_tokens = 0
+        batch_size = max(1, self.config.batch_size)
+        batches = [
+            reviewable[i : i + batch_size] for i in range(0, len(reviewable), batch_size)
+        ]
+        for bi, batch in enumerate(batches, 1):
+            # per-batch context: changed files of this batch + repo retrieval
+            # scoped to the batch's identifiers
+            context_pack, context_files = retriever.assemble_context(
+                batch, top_k=self.config.top_k_chunks
             )
-            result.model = model_used
-            result.tokens_used = tokens
-            llm_comments = self._parse_llm_review(data, reviewable)
-            _log(f"LLM ({model_used}): {len(llm_comments)} comments, {tokens} tokens")
-        except LLMError as e:
-            _log(f"LLM review failed ({e}); returning heuristics-only review")
+            for p in context_files:
+                if p not in result.context_files_used:
+                    result.context_files_used.append(p)
+            _log(
+                f"batch {bi}/{len(batches)}: {len(batch)} file(s), "
+                f"context {len(context_pack)} chars from {len(context_files)} repo files"
+            )
+            messages = build_review_prompt(
+                batch,
+                context_pack,
+                pr_title=pr_title,
+                pr_body=pr_body,
+                base_ref=base_ref,
+                head_ref=head_ref,
+            )
+            try:
+                data, model_used, tokens = self.llm.chat_json(
+                    messages, max_tokens=4096, model=self.config.model
+                )
+                models_used.append(model_used)
+                total_tokens += tokens
+                batch_comments = self._parse_llm_review(data, batch)
+                llm_comments.extend(batch_comments)
+                _log(f"LLM ({model_used}): {len(batch_comments)} comments, {tokens} tokens")
+            except LLMError as e:
+                _log(f"LLM review failed for batch {bi} ({e}); continuing with remaining batches")
+
+        result.tokens_used = total_tokens
+        if models_used:
+            result.model = models_used[0] if len(set(models_used)) == 1 else ", ".join(sorted(set(models_used)))
+        else:
+            _log("LLM unavailable for all batches; returning heuristics-only review")
             result.model = "none (LLM unavailable)"
 
         # 5) merge + dedupe
-        all_comments = self._merge_comments(heuristic_comments, llm_comments)
-        result.comments = all_comments
+        result.comments = self._merge_comments(heuristic_comments, llm_comments)
 
         # 6) summary / verdict
-        if llm_comments or not heuristic_comments:
-            # trust LLM summary when available
-            pass
-        result.summary = self._final_summary(result, had_llm=bool(result.model and "none" not in result.model))
+        result.summary = self._final_summary(
+            result, had_llm=bool(result.model and "none" not in result.model)
+        )
         return result
 
     def _parse_llm_review(self, data: dict, changes: list[FileChange]) -> list[ReviewComment]:
@@ -305,8 +361,19 @@ class Reviewer:
                     context_refs=[str(r) for r in (raw.get("context_refs") or [])][:5],
                 )
             )
-        # stash summary on the instance for _final_summary
-        self._llm_summary = data.get("summary") or {}
+        # accumulate summary across batches (first verdict/overview wins,
+        # strengths are merged)
+        batch_summary = data.get("summary") or {}
+        if not self._llm_summary:
+            self._llm_summary = {
+                "verdict": batch_summary.get("verdict", ""),
+                "overview": batch_summary.get("overview", ""),
+                "strengths": list(batch_summary.get("strengths") or []),
+            }
+        else:
+            self._llm_summary["strengths"].extend(batch_summary.get("strengths") or [])
+            if str(batch_summary.get("verdict", "")).lower() == "request_changes":
+                self._llm_summary["verdict"] = "request_changes"
         return comments
 
     def _merge_comments(

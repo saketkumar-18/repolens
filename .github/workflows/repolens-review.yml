@@ -1,0 +1,39 @@
+name: repolens-review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: repolens-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history so base...head diff works locally
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install RepoLens
+        run: |
+          python -m pip install -U pip
+          pip install "repolens @ git+https://github.com/saketkumar-18/repolens.git"
+
+      - name: Run RepoLens review
+        env:
+          OPENROUTER_API_KEY: *** secrets.OPENROUTER_API_KEY }}
+          GITHUB_TOKEN: *** secrets.GITHUB_TOKEN }}
+        run: |
+          repolens pr "${{ github.repository }}" "${{ github.event.pull_request.number }}" \
+            --local . --post || true
+          # exit code 2 = request-changes; don't fail the workflow for it

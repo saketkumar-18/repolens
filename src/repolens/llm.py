@@ -35,7 +35,7 @@ class LLMClient:
             or os.getenv("OPENROUTER_API_KEY")
             or os.getenv("OPENAI_API_KEY")
             or ""
-        )
+        ).strip()
     )
     models: list[str] = field(
         default_factory=lambda: [
@@ -71,6 +71,10 @@ class LLMClient:
         to the next model.
         """
         candidates = [model] if model else list(self.models)
+        if not self.api_key:
+            raise LLMError(
+                "no API key configured — set OPENROUTER_API_KEY, REPOLENS_API_KEY or OPENAI_API_KEY"
+            )
         last_err: Exception | None = None
         for m in candidates:
             payload: dict = {

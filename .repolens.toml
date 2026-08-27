@@ -1,0 +1,19 @@
+# RepoLens per-repo configuration.
+# Every key is optional; defaults shown as comments.
+# CLI flags / API request fields override these values.
+
+# context_budget = 60000      # chars of repo context per review
+# max_files = 10              # max files sent to the LLM per PR
+# top_k_chunks = 24           # cross-file chunks retrieved
+# batch_size = 6              # files per LLM call (large PRs are batched)
+# min_confidence = 0.4        # drop LLM comments below this confidence
+# include_heuristics = true   # deterministic static checks pass
+# model = ""                  # pin a model; empty = fallback chain
+
+[focus]
+# paths = ["src/**"]          # only review these paths (glob, supports **)
+ignore = [
+    "**/generated/**",
+    "**/*.min.js",
+    "docs/**",
+]

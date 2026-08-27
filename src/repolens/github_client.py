@@ -40,6 +40,7 @@ def _resolve_token() -> str:
 class GitHubClient:
     def __init__(self, token: str | None = None) -> None:
         self.token = token or _resolve_token()
+        self._blob_cache: dict[str, str] = {}  # blob sha -> content
         self._client = httpx.Client(
             timeout=60.0,
             headers={
@@ -105,28 +106,64 @@ class GitHubClient:
         except (ValueError, UnicodeDecodeError):
             return None
 
-    def list_tree(self, repo: str, ref: str, max_files: int = 2000) -> list[str]:
-        """Recursive tree listing of text-ish files at ref (for remote indexing)."""
+    def list_tree(self, repo: str, ref: str, max_files: int = 2000) -> list[dict]:
+        """Recursive tree listing at ref. Returns [{path, sha, size}] for blobs."""
         resp = self._get(f"/repos/{repo}/git/trees/{ref}", recursive="1")
         tree = resp.json().get("tree", [])
-        paths: list[str] = []
+        entries: list[dict] = []
         for entry in tree:
             if entry.get("type") != "blob":
                 continue
             if entry.get("size", 0) > 400_000:
                 continue
-            paths.append(entry["path"])
-            if len(paths) >= max_files:
+            entries.append(
+                {"path": entry["path"], "sha": entry.get("sha", ""), "size": entry.get("size", 0)}
+            )
+            if len(entries) >= max_files:
                 break
-        return paths
+        return entries
 
-    def fetch_repo_files(self, repo: str, ref: str, paths: list[str]) -> list[RepoFile]:
-        """Fetch file contents for remote indexing (skips failures)."""
+    def get_blob(self, repo: str, blob_sha: str) -> str | None:
+        """Fetch a blob by sha (cheaper + cacheable vs contents endpoint)."""
+        try:
+            resp = self._get(f"/repos/{repo}/git/blobs/{blob_sha}")
+        except GitHubError:
+            return None
+        data = resp.json()
+        if data.get("encoding") != "base64":
+            return None
+        try:
+            return base64.b64decode(data.get("content", "")).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            return None
+
+    def fetch_repo_files(
+        self,
+        repo: str,
+        ref: str,
+        paths: list[str],
+        blob_shas: dict[str, str] | None = None,
+    ) -> list[RepoFile]:
+        """Fetch file contents for remote indexing.
+
+        When ``blob_shas`` maps path->sha, unchanged blobs are served from the
+        in-process cache (keyed by blob sha), so repeated reviews of the same
+        repo only download what changed.
+        """
         from .repo_index import CODE_LANGS, detect_language, extract_symbols
 
         out: list[RepoFile] = []
         for p in paths:
-            content = self.get_file_at_ref(repo, p, ref)
+            sha = (blob_shas or {}).get(p, "")
+            content: str | None = None
+            if sha and sha in self._blob_cache:
+                content = self._blob_cache[sha]
+            elif sha:
+                content = self.get_blob(repo, sha)
+                if content is not None:
+                    self._blob_cache[sha] = content
+            if content is None:
+                content = self.get_file_at_ref(repo, p, ref)
             if content is None:
                 continue
             lang = detect_language(p)

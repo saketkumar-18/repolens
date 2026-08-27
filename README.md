@@ -79,10 +79,19 @@ A diff-only reviewer cannot see this at all.
   against the parsed diff: unknown file paths are dropped, line numbers are
   snapped to lines that actually exist in the hunk, so every posted comment
   anchors correctly on GitHub.
+- **Two-signal retrieval.** Lexical (identifier-aware BM25) **plus a
+  reference graph**: files that reference symbols defined by the changed
+  files (callers/importers) get a 2× score boost and an explicit CALL GRAPH
+  section in the prompt — those are exactly the places a change is most
+  likely to break.
 - **Heuristics + LLM, deduplicated.** A deterministic static pass catches the
   classic footguns (hardcoded secrets, f-string SQL, `except: pass`,
   breakpoints, merge markers) with no hallucination risk; the LLM adds
   semantic findings. On duplicate `(path, line)` the heuristic wins.
+- **Batched reviews.** Large PRs are split into file batches (default 6 per
+  LLM call), each with its own scoped context pack; a failed batch never
+  blocks the rest, and verdicts merge conservatively (any request-changes
+  wins).
 - **Provider-agnostic LLM client.** Any OpenAI-compatible endpoint works
   (OpenRouter by default with a free-model fallback chain, OpenAI, Groq,
   Ollama, vLLM). Transient 429/5xx errors retry with backoff, then fall
@@ -92,8 +101,24 @@ A diff-only reviewer cannot see this at all.
   extraction per language family + Okapi BM25 with camelCase/snake_case
   splitting. Installs anywhere, deterministic, fast enough for repos with
   thousands of files.
+- **Per-repo config.** Drop a `.repolens.toml` in the repo root to tune
+  budgets, pin a model, or focus/ignore paths (see the example in this repo).
 - **Graceful degradation everywhere.** Binary files, lockfiles, deleted files
   and oversized PRs are skipped and reported, never fatal.
+
+### GitHub Action (auto-review every PR)
+
+This repo dogfoods itself: `.github/workflows/repolens-review.yml` runs
+RepoLens on every PR and posts the review. To use it in any repo:
+
+```yaml
+# .github/workflows/repolens-review.yml  (copy from this repo)
+# needs repo secret: OPENROUTER_API_KEY (or any supported provider key)
+```
+
+The action checks out the PR with full history, installs RepoLens, reviews
+`base...head` against the local checkout, and posts the formal review with
+inline comments using the built-in `GITHUB_TOKEN`.
 
 ---
 
@@ -121,6 +146,11 @@ Requirements: Python ≥ 3.10. Dependencies: `httpx`, `pydantic`, `fastapi`, `uv
 | `GITHUB_TOKEN` | private repos + posting reviews | — |
 | `REPOLENS_CONTEXT_BUDGET` | chars of repo context per review | `60000` |
 | `REPOLENS_MAX_FILES` | max files sent to the LLM per PR | `10` |
+| `REPOLENS_BATCH_SIZE` | files per LLM call for large PRs | `6` |
+
+All of the above (plus `top_k_chunks`, `min_confidence`, `include_heuristics`,
+`model`, and `[focus]` path globs) can also be set per-repo in a
+`.repolens.toml` at the repo root — see the example in this repo.
 
 ## Usage
 
@@ -173,7 +203,8 @@ Interactive docs at `/docs` (FastAPI/Swagger).
 ## Development
 
 ```bash
-pytest            # 49 tests: parser, retrieval, heuristics, orchestrator, API
+pytest            # 65 tests: parser, retrieval, reference graph, config,
+                  # heuristics, batching, orchestrator, API
 ruff check .      # lint
 ```
 
@@ -184,7 +215,8 @@ src/repolens/
 ├── models.py          # pydantic data model (diffs, comments, results)
 ├── diff_parser.py     # unified-diff parser, exact new-side line numbers
 ├── repo_index.py      # language detection, symbol extraction, chunking
-├── retrieval.py       # identifier-aware BM25 + context-pack assembly  ← capstone
+├── retrieval.py       # identifier-aware BM25 + reference graph + context pack  ← capstone
+├── config.py          # per-repo .repolens.toml configuration
 ├── heuristics.py      # deterministic static checks
 ├── llm.py             # OpenAI-compatible client, retries + fallback chain
 ├── prompts.py         # repo-aware reviewer prompt

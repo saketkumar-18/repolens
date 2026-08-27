@@ -25,6 +25,7 @@ from .models import FileChange, RepoFile
 from .repo_index import chunk_file
 
 _IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
+_IDENT_FULL = re.compile(r"[a-z_][a-z0-9_]{2,}")
 
 # identifiers too generic to drive retrieval
 STOPWORDS = {
@@ -111,19 +112,42 @@ class BM25Index:
 
 
 class RepoContextRetriever:
-    """Builds the repo-level context pack for a review."""
+    """Builds the repo-level context pack for a review.
+
+    Two retrieval signals are combined:
+    1. **Lexical** — identifier-aware BM25 over chunks, queried with the
+       identifiers the diff adds/removes.
+    2. **Reference graph** — we compute which files *reference* symbols
+       defined in the changed files (callers/importers). Those files are the
+       most likely places a change breaks something, so their chunks get a
+       score boost and an explicit "call graph" section is added to the
+       context pack. This is what lets the reviewer catch cross-file
+       regressions that no lexical query would surface.
+    """
+
+    #: multiplicative boost applied to chunks in files that reference a
+    #: symbol defined by the changed files
+    CALLER_BOOST = 2.0
 
     def __init__(self, repo_files: list[RepoFile], context_budget: int = 60_000) -> None:
         self.repo_files = {f.path: f for f in repo_files}
         self.context_budget = context_budget
         self.index = BM25Index()
         self._symbol_to_paths: dict[str, set[str]] = {}
+        self._file_idents: dict[str, set[str]] = {}
         for f in repo_files:
             for chunk in chunk_file(f.path, f.content, f.language):
                 self.index.add(chunk, chunk["text"], extra_tokens=[s.lower() for s in chunk["symbols"]])
             for sym in f.symbols:
                 self._symbol_to_paths.setdefault(sym.lower(), set()).add(f.path)
+            self._file_idents[f.path] = set(_IDENT_FULL.findall(f.content.lower()))
         self.index.build()
+        # reference graph: file -> symbols defined ELSEWHERE that it mentions
+        self._file_refs: dict[str, set[str]] = {}
+        all_defined = set(self._symbol_to_paths)
+        for f in repo_files:
+            own = {s.lower() for s in f.symbols}
+            self._file_refs[f.path] = (self._file_idents[f.path] & all_defined) - own
 
     # -- query construction -------------------------------------------------
 
@@ -145,6 +169,31 @@ class RepoContextRetriever:
                 syms.update(s.lower() for s in f.symbols)
         return syms
 
+    def callers_of_changed_symbols(
+        self, changes: list[FileChange]
+    ) -> dict[str, list[str]]:
+        """Reference graph: for each symbol defined in a changed file,
+        the other files that reference it (callers/importers).
+
+        Returns {symbol: [paths...]} restricted to symbols with >=1 caller.
+        """
+        changed_paths = {ch.path for ch in changes}
+        out: dict[str, list[str]] = {}
+        for ch in changes:
+            f = self.repo_files.get(ch.path)
+            if not f:
+                continue
+            for sym in f.symbols:
+                sym_l = sym.lower()
+                callers = sorted(
+                    p
+                    for p, refs in self._file_refs.items()
+                    if sym_l in refs and p not in changed_paths
+                )
+                if callers:
+                    out[sym] = callers
+        return out
+
     # -- retrieval ----------------------------------------------------------
 
     def retrieve(
@@ -156,6 +205,11 @@ class RepoContextRetriever:
 
         Chunks belonging to the changed files themselves are excluded —
         the prompt already carries those files' full content.
+
+        Scores combine BM25 lexical relevance with a reference-graph boost:
+        chunks in files that reference a symbol defined by the changed files
+        (callers/importers) are multiplied by CALLER_BOOST, because those are
+        exactly the places a change is most likely to break.
         """
         changed_paths = {ch.path for ch in changes} | {
             ch.old_path for ch in changes if ch.old_path
@@ -163,18 +217,29 @@ class RepoContextRetriever:
         terms = self.diff_identifiers(changes)
         # boost symbols defined in changed files: cross-file callers matter
         terms.extend(self.changed_symbols(changes))
-        results = self.index.query(terms, top_k=top_k * 3)
+        results = self.index.query(terms, top_k=top_k * 4)
 
-        picked: list[dict] = []
-        seen_spans: set[tuple[str, int, int]] = set()
+        # files that call/reference symbols defined in the changed files
+        caller_files: set[str] = set()
+        for callers in self.callers_of_changed_symbols(changes).values():
+            caller_files.update(callers)
+
+        scored: list[tuple[float, dict]] = []
         for score, doc in results:
             if doc["path"] in changed_paths:
                 continue
+            boosted = score * self.CALLER_BOOST if doc["path"] in caller_files else score
+            scored.append((boosted, doc))
+        scored.sort(key=lambda x: -x[0])
+
+        picked: list[dict] = []
+        seen_spans: set[tuple[str, int, int]] = set()
+        for score, doc in scored:
             key = (doc["path"], doc["start"], doc["end"])
             if key in seen_spans:
                 continue
             seen_spans.add(key)
-            picked.append({**doc, "score": round(score, 3)})
+            picked.append({**doc, "score": round(score, 3), "is_caller": doc["path"] in caller_files})
             if len(picked) >= top_k:
                 break
         return picked, terms
@@ -190,7 +255,9 @@ class RepoContextRetriever:
 
         Layout:
           1. Full content of changed files (head version) — highest priority.
-          2. Cross-file chunks ranked by BM25 relevance.
+          2. CALL GRAPH section: symbols defined by the change and the files
+             that reference them (reference-graph retrieval).
+          3. Cross-file chunks ranked by BM25 + caller boost.
         Truncated to the configured character budget.
         """
         parts: list[str] = []
@@ -213,10 +280,26 @@ class RepoContextRetriever:
             parts.append(block)
             used += len(block)
 
-        # 2) cross-file retrieval results
+        # 2) call graph: who references the changed symbols?
+        callers = self.callers_of_changed_symbols(changes)
+        if callers:
+            lines = ["### CALL GRAPH (files referencing symbols defined by this change)"]
+            for sym, paths in sorted(callers.items()):
+                lines.append(f"- `{sym}` is referenced by: " + ", ".join(f"`{p}`" for p in paths[:6]))
+            block = "\n".join(lines)
+            if used + len(block) <= self.context_budget:
+                parts.append(block)
+                used += len(block)
+                for paths in callers.values():
+                    for p in paths:
+                        if p not in context_files:
+                            context_files.append(p)
+
+        # 3) cross-file retrieval results
         chunks, _terms = self.retrieve(changes, top_k=top_k)
         for c in chunks:
-            header = f"### REPO CONTEXT: {c['path']} (lines {c['start']}-{c['end']}, relevance {c['score']})"
+            tag = " [CALLER]" if c.get("is_caller") else ""
+            header = f"### REPO CONTEXT{tag}: {c['path']} (lines {c['start']}-{c['end']}, relevance {c['score']})"
             block = f"{header}\n```\n{c['text']}\n```"
             if used + len(block) > self.context_budget:
                 break
