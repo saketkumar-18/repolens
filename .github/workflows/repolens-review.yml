@@ -9,7 +9,7 @@ permissions:
   pull-requests: write
 
 concurrency:
-  group: repolens-${{ github.event.pull_request.number }}
+  group: "repolens-${{ github.event.pull_request.number }}"
   cancel-in-progress: true
 
 jobs:
@@ -31,9 +31,8 @@ jobs:
 
       - name: Run RepoLens review
         env:
-          OPENROUTER_API_KEY: *** secrets.OPENROUTER_API_KEY }}
-          GITHUB_TOKEN: *** secrets.GITHUB_TOKEN }}
+          OPENROUTER_API_KEY: "${{ secrets.OPENROUTER_API_KEY }}"
+          GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
         run: |
-          repolens pr "${{ github.repository }}" "${{ github.event.pull_request.number }}" \
-            --local . --post || true
+          repolens pr "${{ github.repository }}" "${{ github.event.pull_request.number }}"             --local . --post || true
           # exit code 2 = request-changes; don't fail the workflow for it
