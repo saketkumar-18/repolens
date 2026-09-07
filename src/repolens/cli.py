@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 
 from . import __version__
@@ -66,8 +67,8 @@ def _build_parser() -> argparse.ArgumentParser:
     add_common(loc)
 
     srv = sub.add_parser("serve", help="run the HTTP API server")
-    srv.add_argument("--host", default="127.0.0.1")
-    srv.add_argument("--port", type=int, default=8787)
+    srv.add_argument("--host", default="0.0.0.0" if os.environ.get("PORT") else "127.0.0.1")
+    srv.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8787")))
     sub.add_parser("check", help="verify configuration (API key, GitHub token)")
 
     return p
