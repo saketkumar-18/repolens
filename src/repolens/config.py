@@ -26,7 +26,10 @@ from pathlib import Path
 try:
     import tomllib  # py311+
 except ModuleNotFoundError:  # pragma: no cover - py310 fallback
-    tomllib = None  # type: ignore[assignment]
+    try:
+        import tomli as tomllib  # type: ignore[no-redef]
+    except ModuleNotFoundError:
+        tomllib = None  # type: ignore[assignment]
 
 CONFIG_NAME = ".repolens.toml"
 
