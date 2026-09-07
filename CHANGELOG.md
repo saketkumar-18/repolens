@@ -15,3 +15,5 @@ Initial release.
 - Per-repo `.repolens.toml` configuration
 - CLI (pr/local/serve/check) + FastAPI server + markdown/JSON reports
 - GitHub Action for automatic PR reviews
+
+<!-- test: trigger repolens-review -->
