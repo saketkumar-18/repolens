@@ -1,3 +1,5 @@
+**Live demo:** https://repolens-az7g.onrender.com — review any public GitHub PR (try `saketkumar-18/repolens-demo` #1) or paste a raw diff, directly from the browser.
+
 # 🔍 RepoLens
 
 **An LLM code-review agent with repo-level context retrieval.**
